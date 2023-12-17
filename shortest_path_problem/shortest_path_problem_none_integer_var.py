@@ -1,6 +1,7 @@
 """
 同其他文件的使用逻辑，只需要更改少部分的文件
 明细就可以重新使用该文件的功能
+该文件去除01变量强约束改为下0上1连续变量
 """
 from gurobipy import *
 import pandas as pd
@@ -26,13 +27,13 @@ Arcs = {('1', '2'): 15
         , ('6', '7'): 1
 }
 #命名你的模型
-model = Model('Shortest Path Problem')
+model = Model('Shortest Path Problem none integer var')
 
 #加入对应的变量，表示是否从i走到j节点
 X = {}
 for key in Arcs.keys():
     index = 'x_'+key[0]+','+key[1]
-    X[key] = model.addVar(vtype=GRB.BINARY, name=index)
+    X[key] = model.addVar(lb=0,ub=1,vtype=GRB.CONTINUOUS, name=index)
 
 #添加目标函数的功能，根据弧长*01变量以表示走最短路的代价
 obj = LinExpr(0)
@@ -67,7 +68,7 @@ for node in Nodes:
                 lhs.addTerms(-1, X[key])
     model.addConstr(lhs == 0, name = '限制节点进出平衡')
 
-model.write('model_shortest_path_problem.lp')
+model.write('model_shortest_path_problem_none_integer_var.lp')
 model.optimize()
 
 print('Optimal solution:', model.objVal)
