@@ -1,23 +1,27 @@
 from gurobipy import *
+import copy
+import pandas as pd
 import numpy as np
 """
-区别于原有求解器建模，我们将求极大值部分更改为线性模型。
-首先我们需要建立
-1.汽车座椅需求矩阵，此矩阵表示全部的汽车座椅需求清单
-2.对应四种机器，每种机器生成两个矩阵X和Y。
-X_i矩阵为第i种机器生产第几行几列的产品
-Y_i矩阵为第i中机器是否生产第几行几列的产品
-附加以下几种约束
-(1)满足生产数量
-(2)约束生产的转换和启动条件
-(3)小于最大产品生产上限
-*(4)此处求C_total = max(C_1,C_2,C_3,C_4),实现最小化最大问题的目标条件
+两个部分:
+1.初始化模型(直接复制pure_linar_version的代码)
+2.使用次梯度算法进行拉格朗日松弛
 """
+#设置log记录上下界，步长，和theta
+LBlog = []
+UBlog = []
+stepSizelog = []
+thetalog = []
+timer = 0
+#第一部分初始化模型：
 #构建汽车座椅需求矩阵
 #矩阵行为方向，矩阵列为车型，有点奇怪，但是别搞混了
 car_seat_Matrix = np.array([[10,11,26,18,18,25],[15,17,22,9,14,19],[12,17,15,11,28,6],[20,22,21,24,16,18]])
 car_type = 6
 car_seattype = 4
+
+#并且设置一个需要被松弛的约束合集
+relaxedCons = []
 
 #接下来我们需要构建一个模型
 #可以为其取名"linar_parallel_problem"
@@ -114,11 +118,12 @@ model.addConstr(C_group[2] == T_3 + 2.5, name="机器3的时间")
 model.addConstr(C_group[3] == T_4 + 2.5, name="机器4的时间")
 
 #约束2，体现每种座椅生产需求都要被满足
+#在拉格朗日松弛中，我们将约束2设置为被松弛的变量
 for i in range(car_seattype):
     for j in range(car_type):
         expr = LinExpr(0)
         expr.addTerms((1,1,1,1),(X_1[i][j],X_2[i][j],X_3[j],X_4[j]))
-        model.addConstr(expr >= car_seat_Matrix[i][j],name=f"第{j+1}种车的{i+1}方向需满足：")
+        relaxedCons.append(model.addConstr(expr >= car_seat_Matrix[i][j],name=f"第{j+1}种车的{i+1}方向需满足："))
 
 #约束3,体现没有Y就不能被生产
 #此处需要设定一个M变量罚因子
@@ -156,15 +161,121 @@ control_lhs = LinExpr(0)
 control_lhs.addTerms((1, 1, 1, 1), (Z_group[0], Z_group[1], Z_group[2], Z_group[3]))
 model.addConstr(control_lhs >= 1, name=f"此处为求极大值的第9个函数")
 
-#最优化运行，并且给出约束性表格
-model.write("pure_linar_version.lp")
-model.optimize()
+#拉格朗日松弛：次梯度算法
+#首先我们需要设置以下这些拉格朗日松弛的参数
+noChangeCut = 0
+noChangeCutLimit = 5
+squareSum = 0.0     #这是个浮点数
+stepSize = 0.0      #这是步长
+theta = 2.0         #这是theta参数
+LB = 0.0
+UB = 0.0            #设定一个上界和下界
+#这地方还需要加入两个东西
+Lag_multiplier = np.zeros((4,6))      #拉格朗日乘子列表，因为有24个需要被松弛的式子
+slack = np.zeros((4,6))              #松弛
 
-#打印对应答案表
-for var in model.getVars():
-    if(var.x > 0):
-        print(var.varName, '\t', var.x)
-print('obejctive:', model.ObjVal)
+#拉格朗日上界LB = relaxUB通过松弛原有的01和整数变量约束得到一个更小的下界
+model.write("test1.lp")
+model_copy = model.copy()
+model_copy.write('test2.lp')
+relaxed_model = model_copy.relax()
+relaxed_model.write('test3.lp')
+relaxed_model.optimize()
+LB = relaxed_model.ObjVal
+print('下界:', LB)
+LB = 0
+#拉格朗日上界UB = 通过启发式算法得到一个次优解
+# 设置启发式参数
+model_copy.setParam('Heuristics', 0.1)  # 降低启发式强度
+model_copy.setParam('TimeLimit', 10)    # 设置时间限制
+model_copy.setParam('MIPGap', 0.1)      # 增加MIP间隙
+model_copy.setParam('Cuts', 0)          # 减少割的生成
+# 求解模型
+model_copy.optimize()
+UB = model_copy.ObjVal
+print('上界:', UB)
 
-#以表的形式输出
+#用以指示当前模型是否为拉格朗日松弛
+isModelLagrangianRelaxed = False
+
+#取出松弛的约束
+relaxedConsNum = len(relaxedCons)
+for i in range(relaxedConsNum):
+    model.remove(relaxedCons[i])
+relaxedCons = []
+
+#用以指示循环次数的指标
+MaxIter = 60
+
+#接下来我们直接开始'lagrangian relaxtion'主循环！！
+for iter in range(MaxIter):
+
+    #生成拉格朗日的后面的子项
+    obj_lagrangian_relaxed_term = quicksum(
+        [Lag_multiplier[i][j] * (car_seat_Matrix[i][j] - X_1[i][j] - X_2[i][j] - X_3[j] - X_4[j]) for i in range(4) for
+         j in range(6)])
+
+    #拉格朗日的目标函数
+    model.setObjective(obj + obj_lagrangian_relaxed_term, GRB.MINIMIZE)
+
+    #解决并且计算松弛公式并且得到lower bound
+    model.update()
+    model.optimize()
+    print('下界最优解为:', model.ObjVal)
+    if timer == MaxIter - 1:
+        # 打印对应答案表
+        for var in model.getVars():
+            if (var.x > 0):
+                print(var.varName, '\t', var.x)
+        print('obejctive:', model.ObjVal)
+    timer += 1
+    #基于解对每一个被松弛约束计算slack
+    for i in range(4):
+        for j in range(6):
+            slack[i][j] = sum([X_1[i][j].x, X_2[i][j].x, X_3[j].x, X_4[j].x]) - car_seat_Matrix[i][j]
+    print(slack)
+
+    #如果存在可优化，升级lower bound
+    if(model.ObjVal > LB + 1e-6):
+        #1e-6更新太慢了
+        LB = model.ObjVal
+        noChangeCut = 0
+    else:
+        noChangeCut += 1
+
+    #如果noChangecut在一定的limit以内没有优化，theta减半：
+    if(noChangeCut == noChangeCutLimit):
+        theta = theta / 2.0
+        noChangeCut = 0
+
+    #计算squaresum
+    squareSum = sum(slack[i][j]**2.0 for i in range(4) for j in range(6))
+    print(squareSum)
+
+    #更新步长
+    stepSize = theta * (UB - model.ObjVal) / squareSum
+
+    #更新拉格朗日乘子
+    for i in range(4):
+        for j in range(6):
+            if(Lag_multiplier[i][j] > stepSize * slack[i][j]):
+                Lag_multiplier[i][j] = Lag_multiplier[i][j] - stepSize * slack[i][j]
+            else:
+                Lag_multiplier[i][j] = 0.0
+
+
+    LBlog.append(LB)
+    UBlog.append(UB)
+    stepSizelog.append(stepSize)
+    thetalog.append(theta)
+
+#最后报告
+print("\n  ------------ Iteration log information ------------  \n")
+print("  Iter        LB          UB(固定)          theta          stepSize")
+
+for i in range(len(LBlog)):
+    print("  %3d  %12.6f  %12.6f  %8.6f  %8.6f"\
+          %(i,LBlog[i],UBlog[i],thetalog[i],stepSizelog[i]))
+
+
 
